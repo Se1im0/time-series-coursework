@@ -1,0 +1,225 @@
+---
+title: "MTH6139 Time Series" 
+subtitle: "Coursework 1 -- Selim Elmas" 
+author: "Selim Elmas" 
+date: "Spring term 2025" 
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: yeti 
+    highlight: tango
+---
+ 
+```{r, echo=FALSE}
+# This code will display the QMUL logo at the top right of the page
+# Do not change this code
+htmltools::img(src = knitr::image_uri("images/QMlogo.png"),
+               alt = 'logo',
+               style = 'position:absolute; top:0; right:0; padding:10px; width:20%;')
+```
+
+
+# Section 1: Introduction
+## Overview
+
+With this project we would like to investigate and compare the relationship between **crude oil prices** and **Euro/Usd exchange rate**. I will look both at the closing price and daily returns.
+
+Since Oil prices are quoted in US dollars globally, if the dollar becomes weaker the prices of oil becomes cheaper. Additonally, a weaker dollar means the Euro is worth more in dollar terms.
+
+Using the 'tidyquant' package we will be able to retrieve stock data from Yahoo Finance, and then apply **Prophet** forecasting model. 
+
+## Data Loading
+
+```{r echo=TRUE,warning=FALSE,message=FALSE}
+library(prophet)
+library(zoo)
+library(tidyquant)
+library(ggplot2) 
+library(dplyr)
+library(tidyr)
+```
+
+## Data Preparation
+
+"CL=F" is the crude oil futures (USD per barrel)
+
+"EUR/USD=X" is Euro quoted in US dollars
+
+We will be looking at data from "2024-01-01" til now.
+
+```{r warning=FALSE,message=FALSE}
+symbols <- c("CL=F", "EURUSD=X")
+
+price_data <- tq_get(symbols,
+                     get  = "stock.prices",
+                     from = "2024-01-01",
+                     to   = Sys.Date())
+```
+
+Taking a look at the first and last 5 entries of our DataFrame aswell as the structure.
+
+```{r}
+head(price_data)
+tail(price_data)
+glimpse(price_data)
+```
+
+'tq_get' returns one row per symbol per trading day. The columns we care about most are 'symbol', `date`, `close`, and `adjusted`.
+
+### Comparing Data
+
+For comparison, we will reshape the data so Oil and Euro both have their own column and will only be looking at the adjusted closing price.
+
+```{r warning=FALSE,message=TRUE}
+compare <- price_data %>%  
+    select(symbol,date,adjusted) %>%
+    pivot_wider(names_from = symbol,values_from=adjusted) %>%
+    rename(OIL = "CL=F",EURO = "EURUSD=X") %>%
+    unnest(cols=c(OIL,EURO))
+```
+
+Looking at the first 5 entries.
+
+```{r warning=FALSE,message=TRUE}
+head(compare)
+```
+
+# Exploratory Analysis
+
+## Adjusted Prices
+
+Since there is a discrepancy between the closing price of the two instruments, we will use `scales = "free_y"` so each panel has its own y-axis.
+
+The following chart shows the adjusted closing prices of Oil and Euro on separate panels.
+
+```{r message=FALSE, warning=FALSE}
+ggplot(price_data, aes(x = date, y = adjusted, color = symbol)) +
+  geom_line() +
+  facet_wrap(~symbol, scales = "free_y") +
+  labs(title  = "Adjusted Closing Prices: Oil vs Euro/USD",
+       x      = "Date",
+       y      = "Adjusted Price",
+       color  = "Symbol") 
+```
+
+We observe that both graphs follow a similiar trend. Testing this with a linear model:
+
+```{r message=TRUE, warning=FALSE}
+lm_euro <- lm(EURO ~ OIL, data=compare)
+summary(lm_euro)
+```
+
+According to the model, we observe that both parameters (Oil and intercept) are statistically significant at the 5% level. The R-squared of 0.316 means that Oil price explains roughly **31.6%** of the variation in the Euro rate. From this, we see there is a moderate relationship between the two.
+
+## Normalised Prices
+
+We normalise both series so they start at 1.0 on the first trading day.
+
+```{r message=FALSE, warning=FALSE}
+price_data %>%
+    group_by(symbol) %>%
+    mutate(normalised_price = adjusted / first(adjusted)) %>% 
+    ggplot(aes(x = date, y=normalised_price, color=symbol))+
+    geom_line() +
+    scale_color_tq(labels = c("CL=F" = "OIL", "EURUSD=X" = "EURO"))
+    labs(title = "EURO vs OIL")
+```
+
+# Daily Returns
+
+Moving away from adjusted prices, we now look at the **daily percentage returns**.
+
+```{r message=FALSE, warning=FALSE}
+returns <- price_data %>%
+    group_by(symbol)%>%
+    tq_transmute(mutate_fun = periodReturn,period="daily",col_rename = "returns") %>%
+    pivot_wider(names_from = symbol,values_from=returns) %>%
+    rename(OIL_Return = "CL=F",EURO_Return = "EURUSD=X") 
+head(returns)
+```
+
+
+### Daily Percentage Return Plot  
+```{r message=FALSE, warning=FALSE}
+returns %>%
+    pivot_longer(cols = c(OIL_Return, EURO_Return),
+               names_to = "symbol",
+               values_to = "returns") %>%
+    ggplot(aes(x = date, y = returns, color = symbol)) +
+    geom_line() +
+    labs(title = "Daily Returns: Oil vs Euro")
+```
+
+
+From the chart, we can see that **Oil returns are considerably more volatile** than Euro returns. Oil frequently shows large spikes both upward and downward, while the Euro remains in a much narrower band. This highlights how volatile Oil returns are, its more susceptible to supply shocks, geopolitical tensions etc.
+
+## Prophet Forecasting
+
+We create two separate Prophet-compatible data frames. Prophet requires the date column to be named `ds` and the value column to be named `y`.
+
+```{r warning=FALSE}
+oil_returns_df <- returns %>%
+  select(ds = date, y = OIL_Return)
+
+euro_returns_df <- returns %>%
+  select(ds = date, y = EURO_Return)
+```
+
+### Forecasting Oil Returns
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+model_oil    <- prophet(oil_returns_df)
+future_oil   <- make_future_dataframe(model_oil, periods = 100)
+forecast_oil <- predict(model_oil, future_oil)
+```
+
+The  Prophet forecast plot shows the historical oil returns (black points) and the model’s predicted future values (blue line). The shaded region represents uncertainty, which widens as we move further into the forecast. This reflects the increasing difficulty of predicting highly volatile financial returns.
+
+```{r warning=FALSE}
+plot(model_oil, forecast_oil) +
+  labs(title = "Prophet Forecast: Oil Daily Returns",
+       x     = "Date",
+       y     = "Daily Return")
+```
+
+```{r warning=FALSE}
+prophet_plot_components(model_oil, forecast_oil)
+```
+
+From the plot, we can see the general trend for the mean return has been drifiting upwards in our time period. We also see that the mean return tends to be higher on Thursday compared to any other days of the week.
+
+The shaded blue region is also quite wide, reflecting the volatile nature of Oil.
+
+### Forecasting Euro Returns
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+model_euro    <- prophet(euro_returns_df)
+future_euro   <- make_future_dataframe(model_euro, periods = 100)
+forecast_euro <- predict(model_euro, future_euro)
+```
+
+```{r warning=FALSE}
+plot(model_euro, forecast_euro) +
+  labs(title = "Prophet Forecast: Euro/USD Daily Returns",
+       x     = "Date",
+       y     = "Daily Return")
+```
+
+```{r warning=FALSE}
+prophet_plot_components(model_euro, forecast_euro)
+```
+
+From this plot, we see that the mean return tends to be higher on Wednesdays. 
+
+Compared to the Oil forecast, the uncertainty band for the Euro is narrower, reflecting the lower volatility of the instrument.
+
+Overall, we observed a general trend between Oil prices and the Euro. As one moves up so does the other.
+#  Summary
+
+In this project we:
+
+1. Retrieved daily price data for WTI Crude Oil (`CL=F`) and the Euro/USD exchange rate (`EURUSD=X`) from Yahoo Finance.
+2. Visualised the raw and normalised price series to understand relative movements.
+3. Computed daily percentage returns to work with a stationary series.
+4. Applied Meta's Prophet model to each return series and produced 10-day-ahead forecasts.
